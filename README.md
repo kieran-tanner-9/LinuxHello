@@ -9,7 +9,7 @@ It runs seamlessly on modern desktops, handles dynamic webcam priority/hotpluggi
 ## Key Features
 
 *   **Sleek PyQt6 Graphical Interface**: Styled with a Catppuccin Mocha theme (dark slate, lavender/blue highlights) applied globally across all dialogs and popup windows.
-*   **Live Preview Enrollment Assistant**: Shows a real-time `320x240` video frame canvas inside the enrollment dialog to help you frame your face correctly.
+*   **Live Preview Enrollment Assistant**: Shows a real-time `320x240` video frame canvas inside the enrollment dialog to help you frame your face correctly. *(Note: IR camera feeds will naturally display in black and white and may flash/pulse due to active infrared emitter pulses.)*
 *   **5-Second Intelligent Countdown**: Counts down from 5 seconds before capturing a scan, automatically releasing the camera node hardware lock before Howdy launches (preventing webcam capture conflicts on Linux).
 *   **Face Profile Security Matcher**: Integrates a custom verification check when enrolling or improving a profile. It compares the newly scanned face vector against existing ones in `/usr/share/dlib/<user>.dat`. If the Euclidean distance is $> 0.55$, it alerts the user, rejects the addition, and auto-purges the signature.
 *   **Unified Profile Grouping**: Groups multiple facial signatures under a single user profile list item (e.g. `Profile: kieran (2 signatures)`) to reduce UI clutter.

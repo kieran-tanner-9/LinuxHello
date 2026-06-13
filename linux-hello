@@ -1457,6 +1457,17 @@ def cmd_gui():
 
     app = QtWidgets.QApplication(sys.argv)
     
+    # Set global application window icon
+    icon_paths = [
+        "/usr/share/pixmaps/linux-hello.png",
+        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "logo.png"),
+        "/home/kieran/Documents/Coding Projects/logo.png"
+    ]
+    for p in icon_paths:
+        if os.path.exists(p):
+            app.setWindowIcon(QtGui.QIcon(p))
+            break
+            
     # Set QApplication stylesheet to enforce uniform dark theme on dialogs and menus
     app.setStyleSheet("""
         QMainWindow, QDialog, QMessageBox, QInputDialog {

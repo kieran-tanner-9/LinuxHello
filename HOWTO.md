@@ -41,6 +41,9 @@ Before enrolling your face, verify that your webcam streams correctly.
 
 4.  Click **Stop Test** to release the camera hardware.
 
+> [!NOTE]
+> If you are using an Infrared (IR) camera, the preview feed will appear in **black and white (grayscale)** and may show a **noticeable flashing or pulsing effect**. This is completely normal behavior: the active IR emitters pulse rapidly to illuminate and map your face geometry.
+
 ---
 
 ## 3. Enrolling Your Face
