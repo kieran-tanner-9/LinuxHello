@@ -82,6 +82,14 @@ Available Commands:
 
 ---
 
+## Support
+
+If you find this project useful, you can buy me a coffee!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee)](https://buymeacoffee.com/kierantanner9)
+
+---
+
 ## License
 
 This project is licensed under the MIT License - see the `LICENSE` file for details.
