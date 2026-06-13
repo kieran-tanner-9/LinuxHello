@@ -1,0 +1,1605 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import re
+import shutil
+import time
+
+# Color definitions for terminal output
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+def check_root():
+    """Verify script is run with root/sudo permissions."""
+    if os.geteuid() != 0:
+        print(f"{RED}{BOLD}Error:{RESET} This command must be run as root. Please run with {BOLD}sudo{RESET}.")
+        print(f"Example: {CYAN}sudo {sys.argv[0]} {sys.argv[1] if len(sys.argv) > 1 else 'status'}{RESET}")
+        sys.exit(1)
+
+def find_howdy_config():
+    """Find the howdy config.ini path."""
+    paths = [
+        "/etc/howdy/config.ini",
+        "/lib/security/howdy/config.ini",
+        "/usr/share/howdy/config.ini"
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return "/etc/howdy/config.ini"
+
+def get_installed_packages():
+    """Check if howdy and dependencies are installed."""
+    howdy_installed = shutil.which("howdy") is not None
+    v4l_installed = shutil.which("v4l2-ctl") is not None
+    
+    opencv_installed = False
+    try:
+        import cv2
+        opencv_installed = True
+    except ImportError:
+        pass
+        
+    return howdy_installed, v4l_installed, opencv_installed
+
+def get_pam_status():
+    """Check if howdy is configured in PAM."""
+    pam_file = "/etc/pam.d/common-auth"
+    if not os.path.exists(pam_file):
+        return False, "PAM file not found"
+        
+    with open(pam_file, "r") as f:
+        content = f.read()
+        
+    if "pam_howdy.so" in content and not re.search(r"^#.*pam_howdy\.so", content, re.MULTILINE):
+        return True, "Enabled globally via common-auth (pam_howdy.so)"
+    elif "Howdy.py" in content and not re.search(r"^#.*Howdy\.py", content, re.MULTILINE):
+        return True, "Enabled globally via common-auth (Howdy.py)"
+    else:
+        return False, "Disabled"
+
+def get_enrolled_faces():
+    """Get list of enrolled faces."""
+    if shutil.which("howdy") is None:
+        return []
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "default"
+    paths = [
+        f"/usr/share/dlib/{user}.dat",
+        f"/var/lib/howdy/models/{user}.dat",
+        f"/etc/howdy/models/{user}.dat",
+        f"/lib/security/howdy/models/{user}.dat"
+    ]
+    model_file = None
+    for p in paths:
+        if os.path.exists(p):
+            model_file = p
+            break
+            
+    if not model_file:
+        return []
+        
+    try:
+        import json
+        import datetime
+        with open(model_file, "r") as f:
+            data = json.load(f)
+            
+        faces = []
+        for item in data:
+            dt = datetime.datetime.fromtimestamp(item.get("time", 0))
+            date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            faces.append({
+                "id": str(item.get("id", 0)),
+                "date": date_str,
+                "label": item.get("label", "Unknown")
+            })
+        return faces
+    except Exception:
+        pass
+    return []
+
+def get_cameras():
+    """Scan and return all video devices."""
+    devices = []
+    import glob
+    for path in sorted(glob.glob("/sys/class/video4linux/video*")):
+        name_file = os.path.join(path, "name")
+        if os.path.exists(name_file):
+            with open(name_file, "r") as f:
+                name = f.read().strip()
+            dev_node = "/dev/" + os.path.basename(path)
+            devices.append({"device": dev_node, "name": name})
+    return devices
+
+def cmd_status():
+    """Display system status."""
+    print(f"\n{BOLD}{CYAN}=== Linux Hello Configuration Status ==={RESET}\n")
+    
+    # 1. Package Status
+    howdy_inst, v4l_inst, cv_inst = get_installed_packages()
+    print(f"{BOLD}Dependencies:{RESET}")
+    print(f"  - Howdy package:     {GREEN}Installed{RESET}" if howdy_inst else f"  - Howdy package:     {RED}Not Installed{RESET}")
+    print(f"  - v4l-utils (tools): {GREEN}Installed{RESET}" if v4l_inst else f"  - v4l-utils (tools): {RED}Not Installed{RESET}")
+    print(f"  - Python OpenCV:     {GREEN}Installed{RESET}" if cv_inst else f"  - Python OpenCV:     {RED}Not Installed{RESET}")
+    
+    # 2. Camera Status
+    cameras = get_cameras()
+    print(f"\n{BOLD}Video Devices Detected:{RESET}")
+    if not cameras:
+        print(f"  {RED}No camera devices detected.{RESET}")
+    else:
+        for cam in cameras:
+            is_ir = "ir" in cam["name"].lower()
+            tag = f" {MAGENTA}[IR Camera]{RESET}" if is_ir else ""
+            print(f"  - {BOLD}{cam['device']}{RESET}: {cam['name']}{tag}")
+            
+    # 3. Active Configured Camera in Howdy
+    config_path = find_howdy_config()
+    configured_device = "Unknown"
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            for line in f:
+                if line.strip().startswith("device_path"):
+                    parts = line.split("=")
+                    if len(parts) > 1:
+                        configured_device = parts[1].split("#")[0].strip()
+                        break
+        print(f"\n{BOLD}Howdy Configured Camera:{RESET}")
+        print(f"  - Current Path: {YELLOW}{configured_device}{RESET} (Config: {config_path})")
+    
+    # 4. PAM Status
+    pam_enabled, pam_desc = get_pam_status()
+    print(f"\n{BOLD}PAM Authentication (Login/Sudo):{RESET}")
+    print(f"  - Status: " + (f"{GREEN}{BOLD}Enabled{RESET} ({pam_desc})" if pam_enabled else f"{RED}{BOLD}Disabled{RESET}"))
+    
+    # 5. Enrolled faces
+    faces = get_enrolled_faces()
+    print(f"\n{BOLD}Enrolled Face Profiles:{RESET}")
+    if not faces:
+        print(f"  {YELLOW}No faces enrolled yet.{RESET} Run '{CYAN}sudo {sys.argv[0]} enroll{RESET}' to add one.")
+    else:
+        for face in faces:
+            print(f"  - ID: {BOLD}{face['id']}{RESET} | Label: {GREEN}{face['label']}{RESET} | Enrolled: {face['date']}")
+            
+    print()
+
+def cmd_install():
+    """Install howdy and dependencies, and integrate with system launcher."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Installing Howdy & Dependencies ==={RESET}\n")
+    
+    # 1. Add PPA
+    print(f"{BLUE}[1/5] Adding PPA ppa:ubuntuhandbook1/howdy...{RESET}")
+    res = subprocess.run(["add-apt-repository", "-y", "ppa:ubuntuhandbook1/howdy"], check=False)
+    if res.returncode != 0:
+        print(f"{RED}Failed to add PPA. Please verify internet connection and repository state.{RESET}")
+        sys.exit(1)
+        
+    # 2. Update package list
+    print(f"{BLUE}[2/5] Updating package index...{RESET}")
+    subprocess.run(["apt-get", "update"], check=True)
+    
+    # 3. Install packages (including python3-pyqt6)
+    print(f"{BLUE}[3/5] Installing howdy, v4l-utils, python3-opencv, python3-pyqt6...{RESET}")
+    res = subprocess.run(["apt-get", "install", "-y", "howdy", "v4l-utils", "python3-opencv", "python3-pyqt6"], check=False)
+    if res.returncode != 0:
+        print(f"{RED}Failed to install packages. Attempting automatic resolution...{RESET}")
+        subprocess.run(["apt-get", "install", "-f", "-y"], check=True)
+        
+    # 4. Copy ourselves to /usr/local/bin
+    print(f"{BLUE}[4/5] Copying script to /usr/local/bin/linux-hello...{RESET}")
+    try:
+        shutil.copy2(sys.argv[0], "/usr/local/bin/linux-hello")
+        os.chmod("/usr/local/bin/linux-hello", 0o755)
+        print(f"{GREEN}✓ Global executable installed at /usr/local/bin/linux-hello{RESET}")
+    except Exception as e:
+        print(f"{RED}Failed to copy script: {e}{RESET}")
+        sys.exit(1)
+        
+    # 5. Create desktop launcher entry
+    print(f"{BLUE}[5/5] Creating application launcher desktop entry...{RESET}")
+    desktop_entry = """[Desktop Entry]
+Name=Linux Hello
+Comment=Windows Hello Face Authentication for Linux
+Exec=/usr/local/bin/linux-hello gui
+Icon=preferences-system-security
+Terminal=false
+Type=Application
+Categories=Settings;System;Security;
+StartupNotify=true
+"""
+    try:
+        desktop_path = "/usr/share/applications/linux-hello.desktop"
+        with open(desktop_path, "w") as f:
+            f.write(desktop_entry)
+        os.chmod(desktop_path, 0o644)
+        print(f"{GREEN}✓ Desktop launcher created at {desktop_path}{RESET}")
+    except Exception as e:
+        print(f"{RED}Failed to create desktop entry: {e}{RESET}")
+        
+    print(f"\n{GREEN}{BOLD}✓ Installation & System Integration completed!{RESET}")
+    print(f"You can now launch 'Linux Hello' from your desktop application launcher,")
+    print(f"or run the GUI directly from terminal: {CYAN}linux-hello gui{RESET}")
+
+def render_ascii(frame):
+    """Render frame as grayscale ASCII for terminal preview."""
+    import cv2
+    h, w = frame.shape[:2]
+    # Standard terminal dimensions: target width is 60 columns
+    target_w = 60
+    # Line height in terminals is roughly double the width of a character, adjust aspect ratio
+    target_h = int((h / w) * target_w * 0.45)
+    if target_h < 1:
+        target_h = 1
+        
+    resized = cv2.resize(frame, (target_w, target_h))
+    if len(resized.shape) == 3:
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = resized
+        
+    chars = " .:-=+*#%@"
+    num_chars = len(chars)
+    
+    rows = []
+    for r in range(target_h):
+        row_chars = []
+        for c in range(target_w):
+            val = gray[r, c]
+            char_idx = int((val / 255.0) * (num_chars - 1))
+            row_chars.append(chars[char_idx])
+        rows.append("".join(row_chars))
+    return "\n".join(rows)
+
+def cmd_test_camera(device_path=None):
+    """Capture frames from a camera and display them in terminal as ASCII or save a test file."""
+    # Ensure OpenCV is installed
+    try:
+        import cv2
+    except ImportError:
+        print(f"{RED}Error: OpenCV is not installed. Please run installation command first.{RESET}")
+        sys.exit(1)
+        
+    cameras = get_cameras()
+    if not cameras:
+        print(f"{RED}Error: No video devices found on this system.{RESET}")
+        sys.exit(1)
+        
+    # If no device specified, prompt user
+    if not device_path:
+        print(f"\n{BOLD}Select a camera to test:{RESET}")
+        for i, cam in enumerate(cameras):
+            is_ir = "ir" in cam["name"].lower()
+            tag = f" {MAGENTA}[IR Camera]{RESET}" if is_ir else ""
+            print(f"  {BOLD}{i+1}){RESET} {cam['device']} ({cam['name']}){tag}")
+            
+        try:
+            choice = input(f"\nEnter camera number (1-{len(cameras)}) [default: 1]: ").strip()
+            if not choice:
+                idx = 0
+            else:
+                idx = int(choice) - 1
+            if idx < 0 or idx >= len(cameras):
+                print(f"{RED}Invalid selection.{RESET}")
+                sys.exit(1)
+            device_path = cameras[idx]["device"]
+        except (ValueError, KeyboardInterrupt, EOFError):
+            print(f"\n{RED}Selection cancelled.{RESET}")
+            sys.exit(1)
+            
+    print(f"\nOpening video stream on {BOLD}{device_path}{RESET}...")
+    cap = cv2.VideoCapture(device_path)
+    if not cap.isOpened():
+        print(f"{RED}Error: Could not open video device at {device_path}.{RESET}")
+        print("Make sure no other program is using the camera and you have root permissions.")
+        sys.exit(1)
+        
+    print(f"{GREEN}Camera opened successfully.{RESET}")
+    print("Press Ctrl+C at any time to exit the test stream.")
+    time.sleep(1) # Warm up camera
+    
+    # Try graphical preview if DISPLAY environment is set
+    has_display = os.environ.get("DISPLAY") is not None or os.environ.get("WAYLAND_DISPLAY") is not None
+    
+    # Clear screen for terminal ASCII art rendering
+    print("\033[2J", end="")
+    
+    try:
+        frame_count = 0
+        while frame_count < 100:
+            ret, frame = cap.read()
+            if not ret:
+                print(f"\r{RED}Error reading frame from camera.{RESET}", end="")
+                time.sleep(0.1)
+                continue
+                
+            # Render to terminal
+            ascii_frame = render_ascii(frame)
+            print("\033[H", end="")
+            print(f"{BOLD}{CYAN}=== ASCII Camera Preview ({device_path}) ==={RESET}")
+            print(ascii_frame)
+            print(f"\n{YELLOW}Frame: {frame_count}/100. Checking video feed quality.{RESET}")
+            print("Move your head to verify that the camera detects your face movement.")
+            
+            # If graphical display is active, show the OpenCV frame too
+            if has_display:
+                try:
+                    cv2.imshow(f"Linux Hello Test - {device_path}", frame)
+                    # waitKey handles GUI event queue, 1ms delay
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                except Exception:
+                    # Ignore graphical errors and stay in CLI mode
+                    pass
+                    
+            frame_count += 1
+            time.sleep(0.08) # ~12 FPS
+            
+    except KeyboardInterrupt:
+        print("\nTest stopped by user.")
+        
+    finally:
+        cap.release()
+        if has_display:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        print(f"\n{GREEN}Camera test complete.{RESET}")
+
+def cmd_setup_camera():
+    """Setup selected camera in howdy config."""
+    check_root()
+    cameras = get_cameras()
+    if not cameras:
+        print(f"{RED}Error: No video devices found on this system.{RESET}")
+        sys.exit(1)
+        
+    print(f"\n{BOLD}{CYAN}=== Configure Howdy IR Camera ==={RESET}\n")
+    print("Available cameras:")
+    for i, cam in enumerate(cameras):
+        is_ir = "ir" in cam["name"].lower()
+        tag = f" {MAGENTA}[IR Camera - Recommended]{RESET}" if is_ir else ""
+        print(f"  {BOLD}{i+1}){RESET} {cam['device']} ({cam['name']}){tag}")
+        
+    try:
+        choice = input(f"\nEnter camera number to use with Howdy (1-{len(cameras)}): ").strip()
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(cameras):
+            print(f"{RED}Invalid selection.{RESET}")
+            sys.exit(1)
+        selected_device = cameras[idx]["device"]
+    except (ValueError, KeyboardInterrupt, EOFError):
+        print(f"\n{RED}Selection cancelled.{RESET}")
+        sys.exit(1)
+        
+    config_path = find_howdy_config()
+    if not os.path.exists(config_path):
+        print(f"{RED}Error: Howdy config file not found at {config_path}.{RESET}")
+        print("Please run install command first: sudo ./linux-hello install")
+        sys.exit(1)
+        
+    # Backup config file
+    backup_config = config_path + ".bak"
+    shutil.copy2(config_path, backup_config)
+    print(f"Backed up howdy config to {backup_config}")
+    
+    # Update config device path
+    with open(config_path, "r") as f:
+        lines = f.readlines()
+        
+    updated = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("device_path"):
+            parts = line.split("=")
+            comment = ""
+            if "#" in parts[1]:
+                comment = "  #" + parts[1].split("#", 1)[1]
+            lines[i] = f"device_path = {selected_device}{comment.rstrip()}\n"
+            updated = True
+            break
+            
+    if not updated:
+        # If section is [video], insert it
+        for i, line in enumerate(lines):
+            if "[video]" in line:
+                lines.insert(i + 1, f"device_path = {selected_device}\n")
+                updated = True
+                break
+                
+    if not updated:
+        lines.append(f"\ndevice_path = {selected_device}\n")
+        
+    with open(config_path, "w") as f:
+        f.writelines(lines)
+        
+    print(f"{GREEN}{BOLD}✓ Camera set to {selected_device} in config!{RESET}")
+    print(f"Try running test-camera to confirm: {CYAN}sudo {sys.argv[0]} test-camera {selected_device}{RESET}")
+    print(f"Enroll your face next: {CYAN}sudo {sys.argv[0]} enroll{RESET}")
+
+def cmd_enroll():
+    """Enroll a new face model."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Enroll Face Signature ==={RESET}\n")
+    print("This will call the Howdy face enrollment assistant.")
+    print("Please look directly at the camera when the scan starts.")
+    
+    # Prompt for a profile name
+    try:
+        username = os.environ.get("SUDO_USER") or os.environ.get("USER") or "default"
+        label = input(f"Enter a label for this face model [default: {username}]: ").strip()
+        if not label:
+            label = username
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n{RED}Enrollment cancelled.{RESET}")
+        sys.exit(1)
+        
+    print(f"\nStarting enrollment for label: '{BOLD}{label}{RESET}'...")
+    
+    # Howdy add requires interaction
+    try:
+        # We pass label as a command line argument to avoid double labeling prompt
+        res = subprocess.run(["howdy", "add", label], check=False)
+        if res.returncode == 0:
+            print(f"\n{GREEN}{BOLD}✓ Face enrollment complete!{RESET}")
+            print(f"Enable authentication next: {CYAN}sudo {sys.argv[0]} enable-pam{RESET}")
+        else:
+            print(f"\n{RED}Face enrollment failed or was cancelled.{RESET}")
+    except Exception as e:
+        print(f"\n{RED}Error invoking howdy add: {e}{RESET}")
+
+def cmd_enable_pam():
+    """Safely enable face auth globally in PAM."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Enabling PAM Face Authentication ==={RESET}\n")
+    
+    # We prioritize using pam-auth-update if the profile exists
+    howdy_pam_profile = "/usr/share/pam-configs/howdy"
+    
+    if os.path.exists(howdy_pam_profile):
+        print(f"{BLUE}Found standard pam-auth-update profile.{RESET}")
+        print(f"Enabling Howdy PAM profile...{RESET}")
+        # Run non-interactive pam-auth-update to enable
+        res = subprocess.run(["pam-auth-update", "--package", "--enable", "howdy"], check=False)
+        if res.returncode == 0:
+            print(f"{GREEN}{BOLD}✓ PAM face authentication enabled successfully!{RESET}")
+            return
+        else:
+            print(f"{YELLOW}pam-auth-update failed. Falling back to manual PAM modification...{RESET}")
+            
+    # Fallback to manual insertion in /etc/pam.d/common-auth
+    pam_file = "/etc/pam.d/common-auth"
+    backup_file = pam_file + ".orig"
+    
+    if not os.path.exists(pam_file):
+        print(f"{RED}Error: {pam_file} not found. Cannot configure PAM.{RESET}")
+        sys.exit(1)
+        
+    # Backup original configuration if it doesn't exist
+    if not os.path.exists(backup_file):
+        shutil.copy2(pam_file, backup_file)
+        print(f"Created secure PAM backup at {backup_file}")
+        
+    with open(pam_file, "r") as f:
+        lines = f.readlines()
+        
+    # Check if already added
+    already_exists = False
+    for line in lines:
+        if "pam_howdy.so" in line and not line.strip().startswith("#"):
+            already_exists = True
+            break
+            
+    if already_exists:
+        print(f"{GREEN}PAM authentication is already enabled for Howdy.{RESET}")
+        return
+        
+    # Locate pam_unix.so line
+    unix_idx = -1
+    for i, line in enumerate(lines):
+        if "pam_unix.so" in line and not line.strip().startswith("#"):
+            unix_idx = i
+            break
+            
+    if unix_idx == -1:
+        print(f"{RED}Error: Could not locate pam_unix.so in {pam_file}.{RESET}")
+        print("To protect your system from lockout, PAM was not modified.")
+        sys.exit(1)
+        
+    # Insert pam_howdy.so line before pam_unix.so
+    # sufficient means: if Howdy succeeds, authorize immediately; if fails, fall back to next lines (pam_unix.so)
+    howdy_line = "auth\tsufficient\tpam_howdy.so\n"
+    lines.insert(unix_idx, howdy_line)
+    
+    with open(pam_file, "w") as f:
+        f.writelines(lines)
+        
+    print(f"{GREEN}{BOLD}✓ PAM face authentication enabled successfully!{RESET}")
+    print(f"For safety, keep this terminal open and open a NEW terminal window to test '{BOLD}sudo whoami{RESET}'.")
+
+def cmd_disable_pam():
+    """Disable face auth in PAM by restoring backup."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Disabling PAM Face Authentication ==={RESET}\n")
+    
+    # Try pam-auth-update first
+    howdy_pam_profile = "/usr/share/pam-configs/howdy"
+    if os.path.exists(howdy_pam_profile):
+        print(f"Disabling Howdy PAM profile...{RESET}")
+        res = subprocess.run(["pam-auth-update", "--package", "--disable", "howdy"], check=False)
+        if res.returncode == 0:
+            print(f"{GREEN}{BOLD}✓ Face authentication disabled.{RESET}")
+            return
+            
+    # Try manual restore
+    pam_file = "/etc/pam.d/common-auth"
+    backup_file = pam_file + ".orig"
+    
+    restored = False
+    if os.path.exists(backup_file):
+        shutil.copy2(backup_file, pam_file)
+        print(f"Restored original PAM configuration from {backup_file}")
+        restored = True
+    else:
+        # If no backup, manually remove the line
+        if os.path.exists(pam_file):
+            with open(pam_file, "r") as f:
+                lines = f.readlines()
+            new_lines = [line for line in lines if "pam_howdy.so" not in line]
+            if len(new_lines) != len(lines):
+                with open(pam_file, "w") as f:
+                    f.writelines(new_lines)
+                print("Manually removed pam_howdy.so configuration from common-auth.")
+                restored = True
+                
+    if restored:
+        print(f"{GREEN}{BOLD}✓ Face authentication disabled.{RESET}")
+    else:
+        print(f"{YELLOW}Face authentication was not enabled in PAM.{RESET}")
+
+def cmd_set_priority(devices):
+    """Save the list of cameras to priority file."""
+    check_root()
+    priority_file = "/etc/howdy/camera_priority.conf"
+    
+    os.makedirs(os.path.dirname(priority_file), exist_ok=True)
+    
+    with open(priority_file, "w") as f:
+        for dev in devices:
+            f.write(f"{dev}\n")
+            
+    print(f"{GREEN}{BOLD}✓ Priority list saved to {priority_file}{RESET}")
+
+def cmd_udev_trigger():
+    """Triggered by udev/systemd when video device changes. Updates Howdy config."""
+    check_root()
+    priority_file = "/etc/howdy/camera_priority.conf"
+    if not os.path.exists(priority_file):
+        return
+        
+    with open(priority_file, "r") as f:
+        priority_list = [line.strip() for line in f if line.strip()]
+        
+    connected_cameras = [cam["device"] for cam in get_cameras()]
+    
+    selected_device = None
+    for dev in priority_list:
+        if dev in connected_cameras:
+            selected_device = dev
+            break
+            
+    if not selected_device:
+        if connected_cameras:
+            selected_device = connected_cameras[0]
+            
+    if selected_device:
+        config_path = find_howdy_config()
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                lines = f.readlines()
+                
+            updated = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("device_path"):
+                    parts = line.split("=")
+                    comment = ""
+                    if "#" in parts[1]:
+                        comment = "  #" + parts[1].split("#", 1)[1]
+                    lines[i] = f"device_path = {selected_device}{comment.rstrip()}\n"
+                    updated = True
+                    break
+                    
+            if not updated:
+                for i, line in enumerate(lines):
+                    if "[video]" in line:
+                        lines.insert(i + 1, f"device_path = {selected_device}\n")
+                        updated = True
+                        break
+                        
+            if not updated:
+                lines.append(f"\ndevice_path = {selected_device}\n")
+                
+            with open(config_path, "w") as f:
+                f.writelines(lines)
+            print(f"{GREEN}{BOLD}✓ Switcher: Howdy camera set to {selected_device}{RESET}")
+
+def cmd_enable_switching():
+    """Install and enable dynamic camera switching via udev and systemd."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Enabling Dynamic Camera Switching ==={RESET}\n")
+    
+    # 1. Create systemd service
+    service_content = """[Unit]
+Description=Linux Hello Camera Switcher
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/linux-hello udev-trigger
+"""
+    service_path = "/etc/systemd/system/linux-hello-switch.service"
+    with open(service_path, "w") as f:
+        f.write(service_content)
+        
+    # 2. Create udev rule
+    udev_content = 'KERNEL=="video*", SUBSYSTEM=="video4linux", ACTION=="add|remove", TAG+="systemd", ENV{SYSTEMD_WANTS}="linux-hello-switch.service"\n'
+    udev_path = "/etc/udev/rules.d/99-linux-hello.rules"
+    with open(udev_path, "w") as f:
+        f.write(udev_content)
+        
+    # 3. Reload systemd and udev
+    print(f"{BLUE}Reloading systemd daemon...{RESET}")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    
+    print(f"{BLUE}Reloading udev rules...{RESET}")
+    subprocess.run(["udevadm", "control", "--reload-rules"], check=True)
+    subprocess.run(["udevadm", "trigger"], check=True)
+    
+    print(f"{GREEN}{BOLD}✓ Dynamic camera switching enabled successfully!{RESET}")
+
+def cmd_disable_switching():
+    """Disable dynamic camera switching by removing rules and services."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Disabling Dynamic Camera Switching ==={RESET}\n")
+    
+    service_path = "/etc/systemd/system/linux-hello-switch.service"
+    udev_path = "/etc/udev/rules.d/99-linux-hello.rules"
+    
+    if os.path.exists(service_path):
+        os.remove(service_path)
+        print(f"Removed systemd service {service_path}")
+        
+    if os.path.exists(udev_path):
+        os.remove(udev_path)
+        print(f"Removed udev rule {udev_path}")
+        
+    print(f"{BLUE}Reloading systemd daemon...{RESET}")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    
+    print(f"{BLUE}Reloading udev rules...{RESET}")
+    subprocess.run(["udevadm", "control", "--reload-rules"], check=True)
+    
+    print(f"{GREEN}{BOLD}✓ Dynamic camera switching disabled.{RESET}")
+
+def cmd_enroll_and_verify(user, label):
+    """Enroll a face signature and verify that it belongs to the profile owner."""
+    check_root()
+    print(f"\n{BOLD}{CYAN}=== Secure Profile Verification & Enrollment ==={RESET}\n", flush=True)
+    
+    # Locate model paths
+    paths = [
+        f"/usr/share/dlib/{user}.dat",
+        f"/var/lib/howdy/models/{user}.dat",
+        f"/etc/howdy/models/{user}.dat",
+        f"/lib/security/howdy/models/{user}.dat"
+    ]
+    model_file = None
+    for p in paths:
+        if os.path.exists(p):
+            model_file = p
+            break
+            
+    if not model_file:
+        for p in paths:
+            parent = os.path.dirname(p)
+            if os.path.exists(parent):
+                model_file = p
+                break
+        if not model_file:
+            model_file = paths[0]
+            
+    # Load existing vectors
+    existing_vectors = []
+    existing_ids = set()
+    if os.path.exists(model_file):
+        try:
+            import json
+            with open(model_file, "r") as f:
+                data = json.load(f)
+            for item in data:
+                if "data" in item and len(item["data"]) > 0:
+                    existing_vectors.append(item["data"][0])
+                if "id" in item:
+                    existing_ids.add(str(item["id"]))
+        except Exception as e:
+            print(f"Warning: Failed to load existing face models: {e}", flush=True)
+
+    # Launch howdy add with user option
+    print(f"Scanning face for user '{user}' under label '{label}'...", flush=True)
+    res = subprocess.run(["howdy", "-U", user, "-y", "add", label], check=False)
+    if res.returncode != 0:
+        print(f"\n{RED}Error: Howdy enrollment failed with exit code {res.returncode}.{RESET}", flush=True)
+        sys.exit(res.returncode)
+        
+    # Read the models file again to extract the new vector and ID
+    if not os.path.exists(model_file):
+        print(f"\n{RED}Error: Model file {model_file} not found after scanning.{RESET}", flush=True)
+        sys.exit(1)
+        
+    new_data = []
+    try:
+        import json
+        with open(model_file, "r") as f:
+            new_data = json.load(f)
+    except Exception as e:
+        print(f"\n{RED}Error: Failed to reload models file: {e}{RESET}", flush=True)
+        sys.exit(1)
+        
+    new_item = None
+    for item in new_data:
+        if "id" in item and str(item["id"]) not in existing_ids:
+            new_item = item
+            break
+            
+    if not new_item:
+        if len(new_data) > len(existing_vectors):
+            new_item = new_data[-1]
+            
+    if not new_item or "data" not in new_item or len(new_item["data"]) == 0:
+        print(f"\n{RED}Error: New face signature was not successfully saved.{RESET}", flush=True)
+        sys.exit(1)
+        
+    new_vector = new_item["data"][0]
+    new_id = str(new_item.get("id"))
+    
+    # Verify against existing vectors if they exist
+    if existing_vectors:
+        import math
+        
+        def euclidean_distance(v1, v2):
+            return math.sqrt(sum((x - y) ** 2 for x, y in zip(v1, v2)))
+            
+        distances = [euclidean_distance(new_vector, ev) for ev in existing_vectors]
+        min_distance = min(distances)
+        print(f"Verification: Minimum Euclidean distance to existing signatures is {min_distance:.4f}", flush=True)
+        
+        # 0.55 is a safe threshold (matches within same person are < 0.60, different > 0.60)
+        if min_distance > 0.55:
+            print(f"\n{RED}{BOLD}Security Alert: Scanned face does not match the owner of this profile!{RESET}", flush=True)
+            print(f"Euclidean distance {min_distance:.4f} exceeds threshold (0.55).", flush=True)
+            print("Removing unverified face signature...", flush=True)
+            
+            # Remove using howdy
+            remove_res = subprocess.run(["howdy", "-U", user, "-y", "remove", new_id], check=False)
+            if remove_res.returncode == 0:
+                print("Unverified signature successfully removed.", flush=True)
+            else:
+                print("Warning: Howdy remove failed. Performing manual database cleanup...", flush=True)
+                try:
+                    updated_data = [item for item in new_data if str(item.get("id")) != new_id]
+                    with open(model_file, "w") as f:
+                        json.dump(updated_data, f)
+                    print("Manual cleanup completed.", flush=True)
+                except Exception as ex:
+                    print(f"Error: Manual cleanup failed: {ex}", flush=True)
+            sys.exit(10) # Custom exit code indicating signature rejection due to mismatch
+            
+    print(f"\n{GREEN}{BOLD}✓ Face signature verified and enrolled successfully!{RESET}", flush=True)
+    sys.exit(0)
+
+def cmd_gui():
+
+    """Launch the PyQt6 graphical configuration manager."""
+    try:
+        from PyQt6 import QtWidgets, QtCore, QtGui
+    except ImportError:
+        print(f"{RED}Error: PyQt6 is not installed.{RESET}")
+        print("Please run the installer to get all dependencies:")
+        print(f"  {CYAN}sudo {sys.argv[0]} install{RESET}")
+        sys.exit(1)
+        
+    class CameraThread(QtCore.QThread):
+        change_pixmap_signal = QtCore.pyqtSignal(QtGui.QImage)
+        
+        def __init__(self, device_path):
+            super().__init__()
+            self.device_path = device_path
+            self._run_flag = True
+            
+        def run(self):
+            import cv2
+            # Attempt to use the V4L2 backend on Linux
+            cap = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                # Fallback backend
+                cap = cv2.VideoCapture(self.device_path)
+                
+            time.sleep(0.5) # Warm up
+            while self._run_flag:
+                ret, frame = cap.read()
+                if ret:
+                    rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = rgb_image.shape
+                    bytes_per_line = ch * w
+                    convert_to_Qt_format = QtGui.QImage(rgb_image.data, w, h, bytes_per_line, QtGui.QImage.Format.Format_RGB888)
+                    p = convert_to_Qt_format.scaled(480, 360, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                    self.change_pixmap_signal.emit(p)
+                else:
+                    time.sleep(0.03)
+            cap.release()
+            
+        def stop(self):
+            self._run_flag = False
+            self.wait()
+    class EnrollmentDialog(QtWidgets.QDialog):
+        def __init__(self, parent=None, label="default", dev_path="/dev/video0"):
+            super().__init__(parent)
+            self.label = label
+            self.dev_path = dev_path
+            self.process = None
+            self.preview_thread = None
+            self.countdown = 5
+            self.countdown_timer = None
+            self.init_ui()
+            
+        def init_ui(self):
+            self.setWindowTitle("Face Enrollment Assistant")
+            self.setFixedSize(450, 420)
+            self.setModal(True)
+            
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(20, 20, 20, 20)
+            layout.setSpacing(15)
+            
+            self.lbl_title = QtWidgets.QLabel(f"Enrolling Face Profile: '{self.label}'")
+            self.lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #f5c2e7;")
+            layout.addWidget(self.lbl_title)
+            
+            # Integrated live video preview label
+            self.lbl_cam_preview = QtWidgets.QLabel("Initializing Camera...")
+            self.lbl_cam_preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.lbl_cam_preview.setStyleSheet("""
+                background-color: #11111b; 
+                border: 2px dashed #45475a; 
+                border-radius: 8px;
+                font-size: 13px; 
+                color: #585b70;
+            """)
+            self.lbl_cam_preview.setFixedSize(320, 240)
+            layout.addWidget(self.lbl_cam_preview, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+            
+            self.lbl_status = QtWidgets.QLabel("Adjust your position. Scanning in 5 seconds...")
+            self.lbl_status.setStyleSheet("color: #a6adc8; font-size: 13px;")
+            self.lbl_status.setWordWrap(True)
+            layout.addWidget(self.lbl_status)
+            
+            self.progress_bar = QtWidgets.QProgressBar()
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #313244;
+                    border-radius: 5px;
+                    text-align: center;
+                    background-color: #181825;
+                    font-weight: bold;
+                }
+                QProgressBar::chunk {
+                    background-color: #a6e3a1;
+                    border-radius: 4px;
+                }
+            """)
+            layout.addWidget(self.progress_bar)
+            
+            layout.addStretch()
+            
+            self.btn_done = QtWidgets.QPushButton("Cancel")
+            self.btn_done.clicked.connect(self.on_button_clicked)
+            layout.addWidget(self.btn_done, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+            
+            self.start_preview()
+            
+        def start_preview(self):
+            self.preview_thread = CameraThread(self.dev_path)
+            self.preview_thread.change_pixmap_signal.connect(self.update_preview)
+            self.preview_thread.start()
+            
+            self.countdown_timer = QtCore.QTimer(self)
+            self.countdown_timer.timeout.connect(self.tick_countdown)
+            self.countdown_timer.start(1000)
+            
+        def update_preview(self, qimage):
+            p = QtGui.QPixmap.fromImage(qimage).scaled(320, 240, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+            self.lbl_cam_preview.setPixmap(p)
+            
+        def tick_countdown(self):
+            self.countdown -= 1
+            if self.countdown > 0:
+                self.lbl_status.setText(f"Adjust your position. Scanning in {self.countdown} seconds...")
+            else:
+                self.countdown_timer.stop()
+                self.lbl_status.setText("Capturing face signature... Please look straight at the camera.")
+                
+                # Stop camera thread to release hardware lock so Howdy can open it
+                if self.preview_thread:
+                    self.preview_thread.stop()
+                    self.preview_thread = None
+                    
+                self.lbl_cam_preview.setText("Scanning active...")
+                self.lbl_cam_preview.setPixmap(QtGui.QPixmap())
+                
+                self.start_enrollment()
+                
+        def start_enrollment(self):
+            import pwd
+            self.progress_bar.setRange(0, 0) # Indeterminate marquee mode while Howdy captures
+            self.process = QtCore.QProcess(self)
+            self.process.readyReadStandardOutput.connect(self.handle_stdout)
+            self.process.readyReadStandardError.connect(self.handle_stderr)
+            self.process.finished.connect(self.handle_finished)
+            
+            try:
+                curr_user = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+            except Exception:
+                curr_user = "default"
+                
+            script_path = os.path.abspath(sys.argv[0])
+            self.process.start("pkexec", [script_path, "enroll-and-verify", curr_user, self.label])
+            
+        def handle_stdout(self):
+            try:
+                data = self.process.readAllStandardOutput().data().decode("utf-8", errors="ignore")
+                for line in data.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    print(f"[Howdy stdout] {line}")
+                    
+                    if "look straight into the camera" in line.lower() or "look directly at the camera" in line.lower():
+                        self.lbl_status.setText("Camera Active: Look straight into the camera!")
+                        self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 14px;")
+                    elif "scan complete" in line.lower() or "added new model" in line.lower() or "completed" in line.lower() or "added a new model" in line.lower():
+                        self.lbl_status.setText("Success! Face model enrolled.")
+                        self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+            except Exception:
+                pass
+                
+        def handle_stderr(self):
+            try:
+                data = self.process.readAllStandardError().data().decode("utf-8", errors="ignore")
+                for line in data.splitlines():
+                    line = line.strip()
+                    if line:
+                        print(f"[Howdy stderr] {line}")
+            except Exception:
+                pass
+            
+        def handle_finished(self, exit_code, exit_status):
+            self.btn_done.setText("Close")
+            self.progress_bar.setRange(0, 100)
+            if exit_code == 0:
+                self.progress_bar.setValue(100)
+                self.lbl_status.setText("Face enrollment completed successfully!")
+                self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
+            elif exit_code == 10:
+                self.progress_bar.setValue(0)
+                self.lbl_status.setText("Security Alert: Face did not match the owner of this profile. Signature rejected!")
+                self.lbl_status.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 13px;")
+            else:
+                self.progress_bar.setValue(0)
+                self.lbl_status.setText("Face enrollment failed or was cancelled.")
+                self.lbl_status.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 13px;")
+                
+        def on_button_clicked(self):
+            if self.countdown_timer:
+                self.countdown_timer.stop()
+            if self.preview_thread:
+                self.preview_thread.stop()
+            if self.process and self.process.state() == QtCore.QProcess.ProcessState.Running:
+                self.process.kill()
+            self.accept()
+            
+        def reject(self):
+            if self.countdown_timer:
+                self.countdown_timer.stop()
+            if self.preview_thread:
+                self.preview_thread.stop()
+            if self.process and self.process.state() == QtCore.QProcess.ProcessState.Running:
+                self.process.kill()
+            super().reject()
+
+    class LinuxHelloWindow(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.preview_thread = None
+            self.init_ui()
+            
+        def init_ui(self):
+            self.setWindowTitle("Linux Hello Manager")
+            self.resize(800, 600)
+            self.setMinimumSize(800, 600)
+            
+            # Styling is applied at application level in cmd_gui
+            pass
+            
+            # Main widget & layout
+            main_widget = QtWidgets.QWidget()
+            self.setCentralWidget(main_widget)
+            main_layout = QtWidgets.QVBoxLayout(main_widget)
+            main_layout.setContentsMargins(15, 15, 15, 15)
+            main_layout.setSpacing(15)
+            
+            # Header layout
+            header_layout = QtWidgets.QHBoxLayout()
+            title_label = QtWidgets.QLabel("Linux Hello Manager")
+            title_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #f5c2e7;")
+            subtitle_label = QtWidgets.QLabel("Face Authentication Control Panel")
+            subtitle_label.setStyleSheet("font-size: 13px; color: #a6adc8; font-style: italic;")
+            header_layout.addWidget(title_label)
+            header_layout.addStretch()
+            header_layout.addWidget(subtitle_label)
+            main_layout.addLayout(header_layout)
+            
+            # Content layout (Left & Right columns)
+            content_layout = QtWidgets.QHBoxLayout()
+            content_layout.setSpacing(15)
+            
+            # Left column layout
+            left_layout = QtWidgets.QVBoxLayout()
+            left_layout.setSpacing(15)
+            
+            # Status GroupBox
+            status_group = QtWidgets.QGroupBox("System Status")
+            status_grid = QtWidgets.QGridLayout(status_group)
+            status_grid.setSpacing(10)
+            
+            # PAM Status Row
+            status_grid.addWidget(QtWidgets.QLabel("PAM Face Auth:"), 0, 0)
+            self.lbl_pam_status = QtWidgets.QLabel("Disabled")
+            self.lbl_pam_status.setStyleSheet("font-weight: bold;")
+            status_grid.addWidget(self.lbl_pam_status, 0, 1)
+            self.btn_toggle_pam = QtWidgets.QPushButton("Toggle PAM")
+            self.btn_toggle_pam.clicked.connect(self.toggle_pam)
+            status_grid.addWidget(self.btn_toggle_pam, 0, 2)
+            
+            # Switching Status Row
+            status_grid.addWidget(QtWidgets.QLabel("Dynamic Switching:"), 1, 0)
+            self.lbl_switching_status = QtWidgets.QLabel("Disabled")
+            self.lbl_switching_status.setStyleSheet("font-weight: bold;")
+            status_grid.addWidget(self.lbl_switching_status, 1, 1)
+            self.btn_toggle_switching = QtWidgets.QPushButton("Toggle Switching")
+            self.btn_toggle_switching.clicked.connect(self.toggle_switching)
+            status_grid.addWidget(self.btn_toggle_switching, 1, 2)
+            
+            left_layout.addWidget(status_group)
+            
+            # Preview GroupBox
+            preview_group = QtWidgets.QGroupBox("Live Camera Preview")
+            preview_vbox = QtWidgets.QVBoxLayout(preview_group)
+            preview_vbox.setSpacing(10)
+            
+            self.lbl_preview = QtWidgets.QLabel("Camera Preview Inactive")
+            self.lbl_preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.lbl_preview.setStyleSheet("""
+                background-color: #11111b; 
+                border: 2px dashed #45475a; 
+                border-radius: 8px;
+                font-size: 14px; 
+                color: #585b70;
+            """)
+            self.lbl_preview.setFixedSize(360, 270)
+            preview_vbox.addWidget(self.lbl_preview, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+            
+            self.btn_test_cam = QtWidgets.QPushButton("Test Selected Camera")
+            self.btn_test_cam.clicked.connect(self.toggle_preview)
+            preview_vbox.addWidget(self.btn_test_cam)
+            
+            left_layout.addWidget(preview_group)
+            content_layout.addLayout(left_layout, stretch=1)
+            
+            # Right column layout
+            right_layout = QtWidgets.QVBoxLayout()
+            right_layout.setSpacing(15)
+            
+            # Camera Priority GroupBox
+            cam_group = QtWidgets.QGroupBox("Camera Priority Settings")
+            cam_hbox = QtWidgets.QHBoxLayout(cam_group)
+            cam_hbox.setSpacing(10)
+            
+            self.list_cameras = QtWidgets.QListWidget()
+            cam_hbox.addWidget(self.list_cameras, stretch=1)
+            
+            cam_buttons_vbox = QtWidgets.QVBoxLayout()
+            cam_buttons_vbox.setSpacing(8)
+            
+            btn_up = QtWidgets.QPushButton("▲ Up")
+            btn_up.clicked.connect(self.move_up)
+            cam_buttons_vbox.addWidget(btn_up)
+            
+            btn_down = QtWidgets.QPushButton("▼ Down")
+            btn_down.clicked.connect(self.move_down)
+            cam_buttons_vbox.addWidget(btn_down)
+            
+            cam_buttons_vbox.addStretch()
+            
+            self.btn_save_priority = QtWidgets.QPushButton("Save Priority")
+            self.btn_save_priority.setObjectName("btn_primary")
+            self.btn_save_priority.clicked.connect(self.save_priority)
+            cam_buttons_vbox.addWidget(self.btn_save_priority)
+            
+            cam_hbox.addLayout(cam_buttons_vbox)
+            right_layout.addWidget(cam_group, stretch=1)
+            
+            # Face Profiles GroupBox
+            profile_group = QtWidgets.QGroupBox("Enrolled Face Profiles")
+            profile_hbox = QtWidgets.QHBoxLayout(profile_group)
+            profile_hbox.setSpacing(10)
+            
+            self.list_profiles = QtWidgets.QListWidget()
+            profile_hbox.addWidget(self.list_profiles, stretch=1)
+            
+            profile_buttons_vbox = QtWidgets.QVBoxLayout()
+            profile_buttons_vbox.setSpacing(8)
+            
+            self.btn_enroll = QtWidgets.QPushButton("Enroll Face")
+            self.btn_enroll.setObjectName("btn_success")
+            self.btn_enroll.clicked.connect(self.add_profile)
+            profile_buttons_vbox.addWidget(self.btn_enroll)
+            
+            self.btn_improve = QtWidgets.QPushButton("Improve...")
+            self.btn_improve.setObjectName("btn_primary")
+            self.btn_improve.clicked.connect(self.improve_profile)
+            profile_buttons_vbox.addWidget(self.btn_improve)
+            
+            self.btn_delete_profile = QtWidgets.QPushButton("Delete Selected")
+            self.btn_delete_profile.setObjectName("btn_danger")
+            self.btn_delete_profile.clicked.connect(self.delete_profile)
+            profile_buttons_vbox.addWidget(self.btn_delete_profile)
+            
+            profile_buttons_vbox.addStretch()
+            profile_hbox.addLayout(profile_buttons_vbox)
+            right_layout.addWidget(profile_group, stretch=1)
+            
+            self.list_profiles.currentItemChanged.connect(self.on_profile_selection_changed)
+            self.btn_improve.setEnabled(False)
+            self.btn_delete_profile.setEnabled(False)
+            
+            content_layout.addLayout(right_layout, stretch=1)
+            main_layout.addLayout(content_layout, stretch=1)
+            
+            # Initial load
+            self.update_status()
+            self.load_camera_list()
+            self.update_profiles()
+            
+        def update_status(self):
+            pam_enabled, pam_desc = get_pam_status()
+            if pam_enabled:
+                self.lbl_pam_status.setText("Enabled")
+                self.lbl_pam_status.setStyleSheet("font-weight: bold; color: #a6e3a1;")
+            else:
+                self.lbl_pam_status.setText("Disabled")
+                self.lbl_pam_status.setStyleSheet("font-weight: bold; color: #f38ba8;")
+                
+            switching_active = os.path.exists("/etc/udev/rules.d/99-linux-hello.rules")
+            if switching_active:
+                self.lbl_switching_status.setText("Enabled")
+                self.lbl_switching_status.setStyleSheet("font-weight: bold; color: #a6e3a1;")
+            else:
+                self.lbl_switching_status.setText("Disabled")
+                self.lbl_switching_status.setStyleSheet("font-weight: bold; color: #f38ba8;")
+
+        def load_camera_list(self):
+            self.list_cameras.clear()
+            
+            priority_list = []
+            priority_file = "/etc/howdy/camera_priority.conf"
+            if os.path.exists(priority_file):
+                try:
+                    with open(priority_file, "r") as f:
+                        priority_list = [line.strip() for line in f if line.strip()]
+                except Exception:
+                    pass
+                    
+            connected = get_cameras()
+            connected_devs = [c["device"] for c in connected]
+            
+            final_list = []
+            for dev in priority_list:
+                if dev in connected_devs:
+                    cam = next(c for c in connected if c["device"] == dev)
+                    final_list.append((dev, cam["name"], True))
+                    
+            for dev in priority_list:
+                if dev not in connected_devs:
+                    final_list.append((dev, "Disconnected Camera", False))
+                    
+            for cam in connected:
+                dev = cam["device"]
+                if dev not in priority_list:
+                    final_list.append((dev, cam["name"], True))
+                    
+            for dev, name, is_conn in final_list:
+                is_ir = "ir" in name.lower() or "ir" in dev.lower()
+                tag = " [IR]" if is_ir else ""
+                status = "" if is_conn else " [Disconnected]"
+                item_text = f"{dev} ({name}){tag}{status}"
+                
+                item = QtWidgets.QListWidgetItem(item_text)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, dev)
+                
+                if not is_conn:
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#585b70")))
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
+                    
+                self.list_cameras.addItem(item)
+                
+            if self.list_cameras.count() > 0:
+                self.list_cameras.setCurrentRow(0)
+
+        def update_profiles(self):
+            self.list_profiles.clear()
+            faces = get_enrolled_faces()
+            
+            # Group by label
+            grouped = {}
+            for face in faces:
+                lbl = face["label"]
+                if lbl not in grouped:
+                    grouped[lbl] = []
+                grouped[lbl].append(face)
+                
+            # Populate QListWidget
+            for lbl, models in grouped.items():
+                count = len(models)
+                count_str = f" ({count} signature{'s' if count > 1 else ''})" if count > 1 else ""
+                item_text = f"Profile: {lbl}{count_str}"
+                
+                item = QtWidgets.QListWidgetItem(item_text)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, [m["id"] for m in models]) # List of IDs
+                item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, lbl) # Profile label
+                self.list_profiles.addItem(item)
+                
+            if self.list_profiles.count() > 0:
+                self.list_profiles.setCurrentRow(0)
+
+        def move_up(self):
+            row = self.list_cameras.currentRow()
+            if row > 0:
+                item = self.list_cameras.takeItem(row)
+                self.list_cameras.insertItem(row - 1, item)
+                self.list_cameras.setCurrentRow(row - 1)
+                
+        def move_down(self):
+            row = self.list_cameras.currentRow()
+            if row < self.list_cameras.count() - 1:
+                item = self.list_cameras.takeItem(row)
+                self.list_cameras.insertItem(row + 1, item)
+                self.list_cameras.setCurrentRow(row + 1)
+
+        def toggle_pam(self):
+            pam_enabled, _ = get_pam_status()
+            cmd = "disable-pam" if pam_enabled else "enable-pam"
+            self.stop_preview()
+            res = subprocess.run(["pkexec", "/usr/local/bin/linux-hello", cmd], capture_output=True, text=True)
+            if res.returncode == 0:
+                self.update_status()
+                QtWidgets.QMessageBox.information(self, "Success", f"PAM Face Authentication has been {'disabled' if pam_enabled else 'enabled'}.")
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to modify PAM configuration:\n{res.stderr or 'Cancelled by user'}")
+
+        def toggle_switching(self):
+            switching_active = os.path.exists("/etc/udev/rules.d/99-linux-hello.rules")
+            cmd = "disable-switching" if switching_active else "enable-switching"
+            res = subprocess.run(["pkexec", "/usr/local/bin/linux-hello", cmd], capture_output=True, text=True)
+            if res.returncode == 0:
+                self.update_status()
+                QtWidgets.QMessageBox.information(self, "Success", f"Dynamic Camera Switching has been {'disabled' if switching_active else 'enabled'}.")
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to modify switching configuration:\n{res.stderr or 'Cancelled by user'}")
+
+        def save_priority(self):
+            priority_devices = []
+            for i in range(self.list_cameras.count()):
+                item = self.list_cameras.item(i)
+                priority_devices.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                
+            res = subprocess.run(["pkexec", "/usr/local/bin/linux-hello", "set-priority"] + priority_devices, capture_output=True, text=True)
+            if res.returncode == 0:
+                QtWidgets.QMessageBox.information(self, "Success", "Camera priority list saved successfully.")
+                subprocess.run(["pkexec", "/usr/local/bin/linux-hello", "udev-trigger"], capture_output=True)
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save priority:\n{res.stderr or 'Cancelled by user'}")
+
+        def delete_profile(self):
+            item = self.list_profiles.currentItem()
+            if not item:
+                QtWidgets.QMessageBox.warning(self, "Warning", "Please select a profile to delete.")
+                return
+                
+            face_ids = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            lbl = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+            
+            reply = QtWidgets.QMessageBox.question(
+                self, "Confirm Delete", f"Are you sure you want to delete profile '{lbl}' and all its associated signatures?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                success = True
+                errors = []
+                # Remove each signature ID
+                for face_id in face_ids:
+                    res = subprocess.run(["pkexec", "howdy", "-y", "remove", face_id], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        success = False
+                        errors.append(res.stderr or f"Failed to remove ID {face_id}")
+                        
+                self.update_profiles()
+                if success:
+                    QtWidgets.QMessageBox.information(self, "Success", f"Profile '{lbl}' deleted successfully.")
+                else:
+                    QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete some signatures:\n" + "\n".join(errors))
+
+        def add_profile(self):
+            self.stop_preview()
+            
+            item = self.list_cameras.currentItem()
+            dev_path = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else "/dev/video0"
+            
+            default_name = os.environ.get("SUDO_USER") or os.environ.get("USER") or "default"
+            label, ok = QtWidgets.QInputDialog.getText(
+                self, "Profile Label", "Enter a label for this face model:", 
+                QtWidgets.QLineEdit.EchoMode.Normal, default_name
+            )
+            if ok and label.strip():
+                dialog = EnrollmentDialog(self, label.strip(), dev_path)
+                dialog.exec()
+                self.update_profiles()
+
+        def improve_profile(self):
+            item = self.list_profiles.currentItem()
+            if not item:
+                return
+                
+            label = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+            
+            # Get currently selected camera path
+            cam_item = self.list_cameras.currentItem()
+            dev_path = cam_item.data(QtCore.Qt.ItemDataRole.UserRole) if cam_item else "/dev/video0"
+            
+            self.stop_preview()
+            
+            dialog = EnrollmentDialog(self, label, dev_path)
+            dialog.exec()
+            self.update_profiles()
+
+        def on_profile_selection_changed(self, current, previous):
+            has_selection = current is not None
+            self.btn_improve.setEnabled(has_selection)
+            self.btn_delete_profile.setEnabled(has_selection)
+
+        def toggle_preview(self):
+            if self.preview_thread and self.preview_thread.isRunning():
+                self.stop_preview()
+            else:
+                item = self.list_cameras.currentItem()
+                if not item:
+                    QtWidgets.QMessageBox.warning(self, "Warning", "Please select a camera device from the list to test.")
+                    return
+                dev_path = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                self.start_preview(dev_path)
+
+        def start_preview(self, dev_path):
+            self.lbl_preview.setText("Initializing camera...")
+            self.preview_thread = CameraThread(dev_path)
+            self.preview_thread.change_pixmap_signal.connect(self.update_preview)
+            self.preview_thread.start()
+            self.btn_test_cam.setText("Stop Test")
+            self.btn_test_cam.setObjectName("btn_danger")
+            self.btn_test_cam.style().unpolish(self.btn_test_cam)
+            self.btn_test_cam.style().polish(self.btn_test_cam)
+
+        def stop_preview(self):
+            if self.preview_thread:
+                self.preview_thread.stop()
+                self.preview_thread = None
+            self.lbl_preview.setText("Camera Preview Inactive")
+            self.lbl_preview.setPixmap(QtGui.QPixmap())
+            self.btn_test_cam.setText("Test Selected Camera")
+            self.btn_test_cam.setObjectName("")
+            self.btn_test_cam.style().unpolish(self.btn_test_cam)
+            self.btn_test_cam.style().polish(self.btn_test_cam)
+
+        def update_preview(self, qimage):
+            self.lbl_preview.setPixmap(QtGui.QPixmap.fromImage(qimage))
+
+        def closeEvent(self, event):
+            self.stop_preview()
+            event.accept()
+
+    app = QtWidgets.QApplication(sys.argv)
+    
+    # Set QApplication stylesheet to enforce uniform dark theme on dialogs and menus
+    app.setStyleSheet("""
+        QMainWindow, QDialog, QMessageBox, QInputDialog {
+            background-color: #1e1e2e;
+        }
+        QWidget {
+            color: #cdd6f4;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+            font-size: 13px;
+        }
+        QGroupBox {
+            border: 2px solid #313244;
+            border-radius: 8px;
+            margin-top: 1.5ex;
+            font-weight: bold;
+            color: #89b4fa;
+            padding: 10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top center;
+            padding: 0 10px;
+        }
+        QPushButton {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #45475a;
+            border-color: #585b70;
+        }
+        QPushButton:pressed {
+            background-color: #585b70;
+        }
+        QPushButton#btn_primary {
+            background-color: #89b4fa;
+            color: #11111b;
+            border: none;
+        }
+        QPushButton#btn_primary:hover {
+            background-color: #b4befe;
+        }
+        QPushButton#btn_success {
+            background-color: #a6e3a1;
+            color: #11111b;
+            border: none;
+        }
+        QPushButton#btn_success:hover {
+            background-color: #94e2d5;
+        }
+        QPushButton#btn_danger {
+            background-color: #f38ba8;
+            color: #11111b;
+            border: none;
+        }
+        QPushButton#btn_danger:hover {
+            background-color: #eba0ac;
+        }
+        QListWidget {
+            background-color: #181825;
+            border: 1px solid #313244;
+            border-radius: 6px;
+            padding: 5px;
+        }
+        QListWidget::item {
+            padding: 8px;
+            border-bottom: 1px solid #313244;
+        }
+        QListWidget::item:selected {
+            background-color: #313244;
+            color: #89b4fa;
+            border-radius: 4px;
+        }
+        QLineEdit {
+            background-color: #181825;
+            border: 1px solid #313244;
+            border-radius: 4px;
+            padding: 6px;
+            color: #cdd6f4;
+        }
+        QLabel {
+            font-weight: 500;
+        }
+    """)
+    
+    window = LinuxHelloWindow()
+    window.show()
+    sys.exit(app.exec())
+
+def print_help():
+    print(f"""
+{BOLD}{MAGENTA}Linux Hello Wrapper Tool - Windows Hello Face Auth for Linux{RESET}
+Usage: {CYAN}sudo {sys.argv[0]} [command]{RESET}
+
+Available Commands:
+  {BOLD}status{RESET}             Show configuration, packages, camera list, and active state.
+  {BOLD}install{RESET}            Add repository and install Howdy & dependencies.
+  {BOLD}setup-camera{RESET}       Configure which camera path Howdy should use.
+  {BOLD}test-camera{RESET}        Launch an interactive ASCII terminal test stream for a camera.
+  {BOLD}enroll{RESET}             Scan your face and add a new face signature.
+  {BOLD}enroll-and-verify{RESET}  Securely enroll face signature with mismatch checking. (requires root)
+  {BOLD}enable-pam{RESET}         Safely configure PAM to enable facial login and sudo authentication.
+  {BOLD}disable-pam{RESET}        Disable facial recognition and restore default PAM authentication.
+  {BOLD}set-priority{RESET}       Save camera list in preferred order. (requires root)
+  {BOLD}udev-trigger{RESET}       Update Howdy config to highest priority connected camera.
+  {BOLD}enable-switching{RESET}   Install and enable dynamic switching udev & systemd service.
+  {BOLD}disable-switching{RESET}  Remove dynamic switching rules and service.
+  {BOLD}gui{RESET}                Open the graphical manager control panel.
+  {BOLD}help{RESET}               Display this help message.
+""")
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(0)
+        
+    cmd = sys.argv[1].lower()
+    
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "setup-camera":
+        cmd_setup_camera()
+    elif cmd == "test-camera":
+        device_path = sys.argv[2] if len(sys.argv) > 2 else None
+        cmd_test_camera(device_path)
+    elif cmd == "enroll":
+        cmd_enroll()
+    elif cmd == "enroll-and-verify":
+        if len(sys.argv) < 4:
+            print(f"{RED}Error: enroll-and-verify requires user and label.{RESET}")
+            print(f"Usage: {sys.argv[0]} enroll-and-verify [user] [label]")
+            sys.exit(1)
+        user = sys.argv[2]
+        label = sys.argv[3]
+        cmd_enroll_and_verify(user, label)
+    elif cmd == "enable-pam":
+        cmd_enable_pam()
+    elif cmd == "disable-pam":
+        cmd_disable_pam()
+    elif cmd == "set-priority":
+        devices = sys.argv[2:]
+        cmd_set_priority(devices)
+    elif cmd == "udev-trigger":
+        cmd_udev_trigger()
+    elif cmd == "enable-switching":
+        cmd_enable_switching()
+    elif cmd == "disable-switching":
+        cmd_disable_switching()
+    elif cmd == "gui":
+        cmd_gui()
+    elif cmd in ("help", "-h", "--help"):
+        print_help()
+    else:
+        print(f"{RED}Unknown command: {cmd}{RESET}")
+        print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
