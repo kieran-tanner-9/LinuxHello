@@ -203,13 +203,33 @@ def cmd_install():
         print(f"{RED}Failed to copy script: {e}{RESET}")
         sys.exit(1)
         
-    # 5. Create desktop launcher entry
-    print(f"{BLUE}[5/5] Creating application launcher desktop entry...{RESET}")
+    # 5. Create desktop launcher entry and copy logo icon
+    print(f"{BLUE}[5/5] Creating application launcher and installing brand icon...{RESET}")
+    
+    # Install brand icon
+    try:
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        logo_src = os.path.join(script_dir, "logo.png")
+        if os.path.exists(logo_src):
+            shutil.copy2(logo_src, "/usr/share/pixmaps/linux-hello.png")
+            os.chmod("/usr/share/pixmaps/linux-hello.png", 0o644)
+            print(f"{GREEN}✓ Brand icon installed to /usr/share/pixmaps/linux-hello.png{RESET}")
+        else:
+            fallback = "/home/kieran/Documents/Coding Projects/logo.png"
+            if os.path.exists(fallback):
+                shutil.copy2(fallback, "/usr/share/pixmaps/linux-hello.png")
+                os.chmod("/usr/share/pixmaps/linux-hello.png", 0o644)
+                print(f"{GREEN}✓ Brand icon installed from fallback path{RESET}")
+            else:
+                print(f"{YELLOW}Warning: logo.png not found, desktop entry will use fallback icon{RESET}")
+    except Exception as e:
+        print(f"{YELLOW}Warning: Failed to copy brand icon: {e}{RESET}")
+
     desktop_entry = """[Desktop Entry]
 Name=Linux Hello
-Comment=Windows Hello Face Authentication for Linux
+Comment=Windows Hello™ Face Authentication for Linux
 Exec=/usr/local/bin/linux-hello gui
-Icon=preferences-system-security
+Icon=linux-hello
 Terminal=false
 Type=Application
 Categories=Settings;System;Security;
