@@ -13,7 +13,7 @@ It runs seamlessly on modern desktops, handles dynamic webcam priority/hotpluggi
 *   **5-Second Intelligent Countdown**: Counts down from 5 seconds before capturing a scan, automatically releasing the camera node hardware lock before Howdy launches (preventing webcam capture conflicts on Linux).
 *   **Face Profile Security Matcher**: Integrates a custom verification check when enrolling or improving a profile. It compares the newly scanned face vector against existing ones in `/usr/share/dlib/<user>.dat`. If the Euclidean distance is $> 0.55$, it alerts the user, rejects the addition, and auto-purges the signature.
 *   **Unified Profile Grouping**: Groups multiple facial signatures under a single user profile list item (e.g. `Profile: kieran (2 signatures)`) to reduce UI clutter.
-*   **Dynamic Camera Switcher**: Configures camera priorities (e.g. favoring your external IR webcam over internal laptop cams) and updates active Howdy settings dynamically via `udev` hotplug rules and `systemd` services.
+*   **Dynamic Camera Switcher (Optimised in v1.0.1)**: Configures camera priorities (e.g. favouring your external IR webcam over internal laptop cams) and updates active Howdy settings dynamically via `udev` hotplug rules and `systemd` services. Version 1.0.1 introduces active functionality testing: if your preferred webcam disconnects or is faulty, the system automatically falls back to the next available working camera in the priority list on every authentication attempt.
 *   **Safe Wayland Integration**: Runs as a standard non-root user for Wayland compatibility, requesting administrative rights via PolicyKit (`pkexec`) only when executing system tasks.
 
 ---
@@ -87,6 +87,13 @@ Available Commands:
 If you find this project useful, you can buy me a coffee!
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee)](https://buymeacoffee.com/kierantanner9)
+
+---
+
+## Changelog
+
+### v1.0.1
+*   **Camera Failure Recovery**: Added automatic camera verification. If the preferred webcam disconnects or is faulty, the PAM authentication pipeline automatically falls back to the next working camera in the priority list to prevent system login lockout.
 
 ---
 

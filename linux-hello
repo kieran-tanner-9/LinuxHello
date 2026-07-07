@@ -485,6 +485,32 @@ def cmd_enable_pam():
     
     if os.path.exists(howdy_pam_profile):
         print(f"{BLUE}Found standard pam-auth-update profile.{RESET}")
+        print(f"{BLUE}Updating pam-configs profile for dynamic camera switching...{RESET}")
+        try:
+            with open(howdy_pam_profile, "r") as f:
+                content = f.read()
+            
+            exec_line = "pam_exec.so seteuid quiet /usr/local/bin/linux-hello udev-trigger"
+            if exec_line not in content:
+                # Remove any old version of the line first
+                lines = content.splitlines()
+                lines = [line for line in lines if not ("pam_exec.so" in line and "udev-trigger" in line)]
+                content = "\n".join(lines) + "\n"
+                
+                if "pam_howdy.so" in content:
+                    profile_lines = content.splitlines()
+                    for idx, line in enumerate(profile_lines):
+                        if "pam_howdy.so" in line:
+                            indent = line[:len(line)-len(line.lstrip())]
+                            profile_lines.insert(idx, f"{indent}[success=ok default=ignore]        pam_exec.so seteuid quiet /usr/local/bin/linux-hello udev-trigger")
+                            break
+                    content = "\n".join(profile_lines) + "\n"
+                    with open(howdy_pam_profile, "w") as f:
+                        f.write(content)
+                    print(f"{GREEN}✓ Updated {howdy_pam_profile}{RESET}")
+        except Exception as e:
+            print(f"{YELLOW}Warning: Could not update {howdy_pam_profile}: {e}{RESET}")
+
         print(f"Enabling Howdy PAM profile...{RESET}")
         # Run non-interactive pam-auth-update to enable
         res = subprocess.run(["pam-auth-update", "--package", "--enable", "howdy"], check=False)
@@ -512,13 +538,25 @@ def cmd_enable_pam():
         
     # Check if already added
     already_exists = False
-    for line in lines:
+    exec_exists = False
+    howdy_idx = -1
+    for i, line in enumerate(lines):
         if "pam_howdy.so" in line and not line.strip().startswith("#"):
             already_exists = True
-            break
+            howdy_idx = i
+        if "pam_exec.so" in line and "udev-trigger" in line and not line.strip().startswith("#"):
+            exec_exists = True
             
-    if already_exists:
+    if already_exists and exec_exists:
         print(f"{GREEN}PAM authentication is already enabled for Howdy.{RESET}")
+        return
+        
+    if already_exists and not exec_exists:
+        exec_line = "auth\t[success=ok default=ignore]\tpam_exec.so seteuid quiet /usr/local/bin/linux-hello udev-trigger\n"
+        lines.insert(howdy_idx, exec_line)
+        with open(pam_file, "w") as f:
+            f.writelines(lines)
+        print(f"{GREEN}✓ Updated manual PAM configuration with dynamic switching hook.{RESET}")
         return
         
     # Locate pam_unix.so line
@@ -533,10 +571,11 @@ def cmd_enable_pam():
         print("To protect your system from lockout, PAM was not modified.")
         sys.exit(1)
         
-    # Insert pam_howdy.so line before pam_unix.so
-    # sufficient means: if Howdy succeeds, authorize immediately; if fails, fall back to next lines (pam_unix.so)
+    # Insert pam_exec and pam_howdy lines before pam_unix.so
+    exec_line = "auth\t[success=ok default=ignore]\tpam_exec.so seteuid quiet /usr/local/bin/linux-hello udev-trigger\n"
     howdy_line = "auth\tsufficient\tpam_howdy.so\n"
-    lines.insert(unix_idx, howdy_line)
+    lines.insert(unix_idx, exec_line)
+    lines.insert(unix_idx + 1, howdy_line)
     
     with open(pam_file, "w") as f:
         f.writelines(lines)
@@ -555,6 +594,18 @@ def cmd_disable_pam():
         print(f"Disabling Howdy PAM profile...{RESET}")
         res = subprocess.run(["pam-auth-update", "--package", "--disable", "howdy"], check=False)
         if res.returncode == 0:
+            # Let's restore the pam-configs profile to avoid leaving our line there
+            try:
+                with open(howdy_pam_profile, "r") as f:
+                    content = f.read()
+                lines = content.splitlines()
+                new_lines = [line for line in lines if "pam_exec.so" not in line or "udev-trigger" not in line]
+                if len(new_lines) != len(lines):
+                    with open(howdy_pam_profile, "w") as f:
+                        f.write("\n".join(new_lines) + "\n")
+                    print(f"{GREEN}✓ Restored {howdy_pam_profile}{RESET}")
+            except Exception as e:
+                print(f"{YELLOW}Warning: Could not restore {howdy_pam_profile}: {e}{RESET}")
             print(f"{GREEN}{BOLD}✓ Face authentication disabled.{RESET}")
             return
             
@@ -572,11 +623,11 @@ def cmd_disable_pam():
         if os.path.exists(pam_file):
             with open(pam_file, "r") as f:
                 lines = f.readlines()
-            new_lines = [line for line in lines if "pam_howdy.so" not in line]
+            new_lines = [line for line in lines if "pam_howdy.so" not in line and not ("pam_exec.so" in line and "udev-trigger" in line)]
             if len(new_lines) != len(lines):
                 with open(pam_file, "w") as f:
                     f.writelines(new_lines)
-                print("Manually removed pam_howdy.so configuration from common-auth.")
+                print("Manually removed Howdy and switching configuration from common-auth.")
                 restored = True
                 
     if restored:
@@ -597,58 +648,168 @@ def cmd_set_priority(devices):
             
     print(f"{GREEN}{BOLD}✓ Priority list saved to {priority_file}{RESET}")
 
+def log_debug(message):
+    try:
+        with open("/tmp/linux-hello-debug.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+    except Exception:
+        pass
+
+def is_camera_working(device_path):
+    """Check if the camera device can be opened and can capture a frame."""
+    log_debug(f"Testing camera {device_path}...")
+    if not os.path.exists(device_path):
+        log_debug(f"Camera {device_path} does not exist on filesystem.")
+        return False
+    
+    # Redirect stderr to devnull to suppress V4L2 and GStreamer warnings
+    stderr_fd = 2
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(stderr_fd)
+        os.dup2(devnull_fd, stderr_fd)
+        os.close(devnull_fd)
+    except Exception as e:
+        log_debug(f"Failed to redirect stderr: {e}")
+        old_stderr = None
+
+    ret = False
+    try:
+        import cv2
+        cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            log_debug(f"cap.isOpened() failed with CAP_V4L2, trying fallback backend...")
+            cap = cv2.VideoCapture(device_path)
+        if not cap.isOpened():
+            log_debug(f"Failed to open camera {device_path} with fallback.")
+            ret = False
+        else:
+            log_debug(f"Camera {device_path} opened successfully. Grabbing frame...")
+            ret, frame = cap.read()
+            cap.release()
+            log_debug(f"Frame grab result: {ret}")
+    except Exception as e:
+        log_debug(f"Exception during camera check: {type(e).__name__}: {e}")
+        ret = False
+    finally:
+        # Restore stderr
+        if old_stderr is not None:
+            try:
+                os.dup2(old_stderr, stderr_fd)
+                os.close(old_stderr)
+            except Exception as e:
+                log_debug(f"Failed to restore stderr: {e}")
+                
+    return ret
+
 def cmd_udev_trigger():
     """Triggered by udev/systemd when video device changes. Updates Howdy config."""
     check_root()
+    log_debug("udev-trigger started.")
     priority_file = "/etc/howdy/camera_priority.conf"
     if not os.path.exists(priority_file):
+        log_debug("Priority file not found.")
         return
         
     with open(priority_file, "r") as f:
         priority_list = [line.strip() for line in f if line.strip()]
+    log_debug(f"Priority list: {priority_list}")
         
     connected_cameras = [cam["device"] for cam in get_cameras()]
+    log_debug(f"Connected cameras: {connected_cameras}")
     
-    selected_device = None
-    for dev in priority_list:
-        if dev in connected_cameras:
-            selected_device = dev
-            break
-            
-    if not selected_device:
-        if connected_cameras:
-            selected_device = connected_cameras[0]
-            
-    if selected_device:
-        config_path = find_howdy_config()
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                lines = f.readlines()
-                
-            updated = False
-            for i, line in enumerate(lines):
+    # Identify the currently configured camera path in Howdy
+    config_path = find_howdy_config()
+    current_device = None
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            for line in f:
                 if line.strip().startswith("device_path"):
                     parts = line.split("=")
-                    comment = ""
-                    if "#" in parts[1]:
-                        comment = "  #" + parts[1].split("#", 1)[1]
-                    lines[i] = f"device_path = {selected_device}{comment.rstrip()}\n"
-                    updated = True
+                    if len(parts) > 1:
+                        current_device = parts[1].split("#")[0].strip()
+                        break
+    log_debug(f"Current device configured in Howdy: {current_device}")
+
+    selected_device = None
+    
+    # 1. Quick check: is the highest-priority connected camera already configured?
+    # This optimization bypasses the OpenCV test for steady-state fast execution.
+    highest_priority_connected = None
+    for dev in priority_list:
+        if dev in connected_cameras:
+            highest_priority_connected = dev
+            break
+            
+    if not highest_priority_connected and connected_cameras:
+        highest_priority_connected = connected_cameras[0]
+    log_debug(f"Highest priority connected camera: {highest_priority_connected}")
+        
+    if highest_priority_connected and highest_priority_connected == current_device:
+        if is_camera_working(current_device):
+            log_debug("Highest priority connected camera matches current device and is verified working. Exiting early.")
+            return
+
+    # 2. Iterate through connected cameras in priority order and find the first working one
+    for dev in priority_list:
+        if dev in connected_cameras:
+            if is_camera_working(dev):
+                selected_device = dev
+                break
+                
+    # 3. Fallback: if no priority list camera works, try any other connected cameras
+    if not selected_device:
+        log_debug("No priority camera works. Trying fallback...")
+        for dev in connected_cameras:
+            if dev not in priority_list:
+                if is_camera_working(dev):
+                    selected_device = dev
                     break
+
+    # If no camera is verified working, fall back to the first connected one
+    if not selected_device and connected_cameras:
+        selected_device = connected_cameras[0]
+        log_debug(f"No cameras verified working. Falling back to first connected: {selected_device}")
+
+    log_debug(f"Selected device: {selected_device}")
+
+    # Only update the config file if the selected device is different from the current device
+    if selected_device and selected_device != current_device:
+        log_debug(f"Updating device path to: {selected_device}")
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    lines = f.readlines()
                     
-            if not updated:
+                updated = False
                 for i, line in enumerate(lines):
-                    if "[video]" in line:
-                        lines.insert(i + 1, f"device_path = {selected_device}\n")
+                    if line.strip().startswith("device_path"):
+                        parts = line.split("=")
+                        comment = ""
+                        if len(parts) > 1 and "#" in parts[1]:
+                            comment = "  #" + parts[1].split("#", 1)[1]
+                        lines[i] = f"device_path = {selected_device}{comment.rstrip()}\n"
                         updated = True
                         break
                         
-            if not updated:
-                lines.append(f"\ndevice_path = {selected_device}\n")
-                
-            with open(config_path, "w") as f:
-                f.writelines(lines)
-            print(f"{GREEN}{BOLD}✓ Switcher: Howdy camera set to {selected_device}{RESET}")
+                if not updated:
+                    for i, line in enumerate(lines):
+                        if "[video]" in line:
+                            lines.insert(i + 1, f"device_path = {selected_device}\n")
+                            updated = True
+                            break
+                            
+                if not updated:
+                    lines.append(f"\ndevice_path = {selected_device}\n")
+                    
+                with open(config_path, "w") as f:
+                    f.writelines(lines)
+                log_debug("Config updated successfully.")
+                print(f"{GREEN}{BOLD}✓ Switcher: Howdy camera set to {selected_device}{RESET}")
+            else:
+                log_debug(f"Config path {config_path} does not exist.")
+        except Exception as e:
+            log_debug(f"Exception while updating config: {type(e).__name__}: {e}")
 
 def cmd_enable_switching():
     """Install and enable dynamic camera switching via udev and systemd."""
@@ -1563,7 +1724,7 @@ def cmd_gui():
 
 def print_help():
     print(f"""
-{BOLD}{MAGENTA}Linux Hello Wrapper Tool - Windows Hello Face Auth for Linux{RESET}
+{BOLD}{MAGENTA}Linux Hello Wrapper Tool v1.0.1 - Windows Hello Face Auth for Linux{RESET}
 Usage: {CYAN}sudo {sys.argv[0]} [command]{RESET}
 
 Available Commands:
@@ -1632,5 +1793,15 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        try:
+            with open("/tmp/linux-hello-debug.log", "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Top-level Exception: {type(e).__name__}: {e}\n")
+                f.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        sys.exit(1)
 
